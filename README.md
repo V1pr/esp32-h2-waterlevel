@@ -18,13 +18,48 @@ Defaults are in `main/app_config.h`.
 | Divider sink | 3 | Bottom resistor returns here, not to GND. Driven low only while sampling. Set `BATTERY_SINK_GPIO` to `-1` if the resistor is tied to GND. |
 | Reset button | 13 | To GND. Wakes the chip and factory-resets the Zigbee network. |
 
-Do not tie VL53L0X VIN straight to 3.3 V. GPIO14 switches it through a load switch, and only for the reading. Ranging draws about 20 mA, so the module must not be powered from the GPIO pin itself. Each shot uses a 20 ms timing budget (`VL53L0X_TIMING_BUDGET_US`), which is as short as this sensor allows without giving up the default ranging steps. Mount the sensor above the water, looking down.
+Do not tie VL53L0X VIN straight to 3.3 V, and do not power the module from a GPIO. Ranging draws about 20 mA with higher peaks. GPIO14 only enables a high-side load switch, and only for the reading. Each shot uses a 20 ms timing budget (`VL53L0X_TIMING_BUDGET_US`). Mount the sensor above the water, looking down.
+
+Use a **TPS22918** in SOT-23-6 (orderable part **TPS22918DBVR**). ON is active high, which matches the firmware. Off current is about 0.5 µA. Pin 1 is the pin by the package mark, looking at the top of the chip:
 
 ```text
-3V3 ---- load switch ---- VL53L0X VIN
-              |
-            GPIO14 (high = on)
+        mark
+     +--------+
+VIN  |1      6| VOUT
+GND  |2      5| QOD
+ON   |3      4| CT
+     +--------+
 ```
+
+| Pin | Name | Connect to |
+| --- | --- | --- |
+| 1 | VIN | ESP32-H2 3V3, with 1 µF ceramic to GND at the pin |
+| 2 | GND | GND |
+| 3 | ON | GPIO14, and a 100 kΩ pulldown to GND |
+| 4 | CT | Leave open. A capacitor here only slows turn-on. |
+| 5 | QOD | VOUT (pin 6), so the sensor supply is discharged when the switch opens |
+| 6 | VOUT | VL53L0X VIN |
+
+ON must not float. The pulldown keeps the switch off until the firmware drives GPIO14. The firmware holds that pin low through deep sleep.
+
+```text
+3V3 ----+---- TPS22918 VIN (1)
+        |         VOUT (6) ---- VL53L0X VIN
+       1µF        QOD (5) ---- VOUT
+        |         CT (4) open
+       GND        ON (3) ----+---- GPIO14
+                             |
+                           100k
+                             |
+                            GND
+
+GPIO10 ---------------- VL53L0X SDA
+GPIO11 ---------------- VL53L0X SCL
+GPIO12 ---------------- VL53L0X XSHUT
+GND ------------------- VL53L0X GND
+```
+
+Leave the module's interrupt pin unconnected.
 
 Battery divider, for a single Li-ion cell and the default 1:1 resistors (100 kΩ / 100 kΩ):
 
