@@ -402,7 +402,10 @@ static void pin_output(gpio_num_t pin, int level)
 static void pin_hold(gpio_num_t pin, int level)
 {
     pin_output(pin, level);
-    gpio_hold_en(pin);
+    esp_err_t err = gpio_hold_en(pin);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "GPIO %d will not stay off in deep sleep (%s)", (int)pin, esp_err_to_name(err));
+    }
 }
 
 static void bus_close(void)
@@ -442,18 +445,15 @@ static esp_err_t bus_open(void)
 void vl53l0x_shutdown(void)
 {
     bus_close();
-    gpio_deep_sleep_hold_dis();
     /* I2C lines go low before the supply, so the pull-ups cannot feed the module. */
     pin_hold(I2C_SDA_GPIO, 0);
     pin_hold(I2C_SCL_GPIO, 0);
     pin_hold(VL53L0X_XSHUT_GPIO, 0);
     pin_hold(VL53L0X_POWER_GPIO, VL53L0X_POWER_ON_LEVEL ? 0 : 1);
-    gpio_deep_sleep_hold_en();
 }
 
 esp_err_t vl53l0x_begin(void)
 {
-    gpio_deep_sleep_hold_dis();
     gpio_hold_dis(VL53L0X_POWER_GPIO);
     gpio_hold_dis(VL53L0X_XSHUT_GPIO);
     gpio_hold_dis(I2C_SDA_GPIO);
