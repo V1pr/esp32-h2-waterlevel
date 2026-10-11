@@ -43,6 +43,12 @@ build/
 Build/
 build-*/
 
+# ESP-IDF
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
 # CMake generated files
 CMakeFiles/
 CMakeCache.txt
