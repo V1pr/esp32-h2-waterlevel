@@ -61,17 +61,53 @@ GND ------------------- VL53L0X GND
 
 Leave the module's interrupt pin unconnected.
 
-Battery divider, for a single Li-ion cell and the default 1:1 resistors (100 kΩ / 100 kΩ):
+## Battery
+
+A single Li-ion cell is about 4.2 V full and 3.3 V empty. Do not connect it to the board's **5V** pin or to **3V3** directly. The onboard regulator expects about 5 V, and a raw cell at 4.2 V is above the ESP32-H2 supply limit. Use a separate 3.3 V regulator. Unplug USB while the regulator is connected.
+
+Any of these will do. The first three sleep at 1–4 µA, which suits a device that is asleep almost all of the time. Output current of 200 mA covers the Zigbee peaks. Near empty, a low-dropout regulator sags with the cell and the chip keeps running down toward 3.0 V.
+
+| Part | Package | Idle current | Output | Notes |
+| --- | --- | --- | --- | --- |
+| MCP1700-3302E/TO | TO-92 | 1.6 µA | 250 mA | Easiest to solder. Preferred choice. |
+| HT7333-A | TO-92 | about 2–4 µA | 250 mA | Buy the **-A** pinout. The -B part swaps pins. |
+| XC6206P332MR | SOT-23 | about 1 µA | about 200 mA | Small. Same SOT-23 pin order as the MCP1700 SOT-23. |
+| MCP1700T-3302E/TT | SOT-23 | 1.6 µA | 250 mA | Same chip as the first row, smaller package. |
+| TPS63001 (or a 3.3 V buck-boost module built on it) | module or chip | tens of µA | 800 mA class | Holds 3.3 V across the whole cell range. Costs more sleep current than an LDO. |
+
+TO-92 pin order for **MCP1700-3302E/TO** and **HT7333-A**, flat face toward you, pins down:
+
+| Pin | Name |
+| --- | --- |
+| 1 | GND |
+| 2 | VIN |
+| 3 | VOUT |
+
+SOT-23 pin order for **XC6206P332MR** and **MCP1700T-3302E/TT**, pins down, pin 1 on the left:
+
+| Pin | Name |
+| --- | --- |
+| 1 | GND |
+| 2 | VOUT |
+| 3 | VIN |
 
 ```text
-pack+ ---- Rhigh ----+---- GPIO1 (ADC)
-                     |
-                   Rlow
-                     |
-                   GPIO3 (sunk to GND only during the reading)
+cell+ ----+---- regulator VIN
+          |         VOUT ---- ESP32-H2 3V3
+          |         GND  ---- ESP32-H2 GND ---- cell-
+          |
+          +---- 100k ----+---- GPIO1 (ADC)
+                         |
+                       100k
+                         |
+                       GPIO3 (divider sink)
 ```
 
-`BATTERY_EMPTY_MV` (3300) and `BATTERY_FULL_MV` (4200) set the 0% and 100% points. The reported Zigbee percentage uses the standard half-percent units on the Power Configuration cluster.
+Put 1 µF ceramic from VIN to GND and 1 µF ceramic from VOUT to GND, both next to the regulator. 10 µF on the output is fine for the HT7333-A.
+
+GPIO1 only measures the cell. GPIO3 is driven low during that sample so the two 100 kΩ resistors do not drain the pack in sleep. `BATTERY_EMPTY_MV` (3300) and `BATTERY_FULL_MV` (4200) set the 0% and 100% points. The reported Zigbee percentage uses the standard half-percent units on the Power Configuration cluster.
+
+A buck-boost module uses the same three wires: cell positive to its VIN, cell negative and the ESP32 GND to its GND, and its 3.3 V output to the ESP32 **3V3** pin. Keep the divider on the cell, not on the regulated 3.3 V.
 
 ## Tank size
 
