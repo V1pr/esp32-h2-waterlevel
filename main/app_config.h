@@ -48,8 +48,18 @@
 /*
  * Wiring, ESP32-H2-DevKitM-1 friendly. Change the GPIOs to match the board.
  *
- * VL53L0X: SDA, SCL, XSHUT, 3V3, GND. XSHUT low holds the sensor in
- * hardware standby while the ESP32 is asleep.
+ * VL53L0X supply is switched by VL53L0X_POWER_GPIO so the module draws
+ * nothing in deep sleep. That pin must be an LP GPIO (7-14); other pins
+ * lose their level when the chip sleeps. High turns the supply on.
+ * Use a high-side load switch. Do not feed the module from the GPIO
+ * itself: ranging draws about 20 mA, with higher peaks.
+ *
+ *   3V3 -- load switch -- VL53L0X VIN
+ *              |
+ *         VL53L0X_POWER_GPIO
+ *
+ * XSHUT stays low until the supply is up, then the driver releases it
+ * for the reading and pulls it low again before the supply is removed.
  *
  * Battery: a divider from the pack to BATTERY_ADC_GPIO, with the bottom
  * resistor returning to BATTERY_SINK_GPIO instead of GND. The sink pin
@@ -71,7 +81,16 @@
 #define I2C_SDA_GPIO 10
 #define I2C_SCL_GPIO 11
 #define VL53L0X_XSHUT_GPIO 12
+/* LP GPIO. Held low through deep sleep so the load switch stays off. */
+#define VL53L0X_POWER_GPIO 14
+#define VL53L0X_POWER_ON_LEVEL 1
 #define VL53L0X_I2C_ADDR 0x29
+/*
+ * Shortest ranging budget the VL53L0X allows with its default steps.
+ * Raise this if the water surface is missed; each extra millisecond is
+ * time the laser is on.
+ */
+#define VL53L0X_TIMING_BUDGET_US 20000
 
 #define BATTERY_ADC_GPIO 1
 #define BATTERY_SINK_GPIO 3

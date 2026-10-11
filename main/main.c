@@ -351,6 +351,8 @@ static void create_timers(void)
 
 void app_main(void)
 {
+    /* Supply off before anything else, including on a cold boot. */
+    vl53l0x_shutdown();
     init_nvs();
     water_settings_init();
     rtc_tick();

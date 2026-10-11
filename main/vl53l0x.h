@@ -3,11 +3,14 @@
 #include "esp_err.h"
 #include <stdint.h>
 
-/* Release XSHUT and run the sensor init. */
+/* Switch the sensor supply on, release XSHUT, and run init. */
 esp_err_t vl53l0x_begin(void);
 
 /* One single-shot range, in millimeters. Call vl53l0x_begin() first. */
 esp_err_t vl53l0x_read_once(uint16_t *distance_mm);
 
-/* Drive XSHUT low and hold it through deep sleep. Safe to call more than once. */
+/*
+ * Remove power and hold the supply, XSHUT, and I2C lines low through
+ * deep sleep. Safe to call more than once.
+ */
 void vl53l0x_shutdown(void);

@@ -21,7 +21,12 @@ enum {
     REG_RESULT_INTERRUPT_STATUS = 0x13,
     REG_RESULT_RANGE_STATUS = 0x14,
     REG_MSRC_CONFIG = 0x60,
+    REG_MSRC_TIMEOUT = 0x46,
     REG_FINAL_RANGE_MIN_COUNT = 0x44,
+    REG_PRE_RANGE_VCSEL = 0x50,
+    REG_PRE_RANGE_TIMEOUT = 0x51,
+    REG_FINAL_RANGE_VCSEL = 0x70,
+    REG_FINAL_RANGE_TIMEOUT = 0x71,
     REG_SYSTEM_SEQUENCE = 0x01,
     REG_DYNAMIC_SPAD_NUM = 0x4E,
     REG_DYNAMIC_SPAD_OFFSET = 0x4F,
@@ -49,7 +54,6 @@ static const uint8_t TUNING[] = {
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_dev;
 static uint8_t s_stop_variable;
-static bool s_gpio_ready;
 
 static esp_err_t write_reg(uint8_t reg, uint8_t value)
 {
@@ -76,6 +80,136 @@ static esp_err_t write_regs(uint8_t reg, const uint8_t *data, size_t len)
 static esp_err_t read_regs(uint8_t reg, uint8_t *data, size_t len)
 {
     return i2c_master_transmit_receive(s_dev, &reg, 1, data, len, 100);
+}
+
+static esp_err_t read_reg16(uint8_t reg, uint16_t *value)
+{
+    uint8_t raw[2];
+    ESP_RETURN_ON_ERROR(read_regs(reg, raw, sizeof(raw)), TAG, "reg16");
+    *value = (uint16_t)((raw[0] << 8) | raw[1]);
+    return ESP_OK;
+}
+
+static esp_err_t write_reg16(uint8_t reg, uint16_t value)
+{
+    uint8_t raw[2] = {(uint8_t)(value >> 8), (uint8_t)value};
+    return write_regs(reg, raw, sizeof(raw));
+}
+
+/* ST's timeout registers pack a count as (LSB << MSB). */
+static uint16_t decode_timeout(uint16_t reg_val)
+{
+    return (uint16_t)(((reg_val & 0x00FF) << ((reg_val & 0xFF00) >> 8)) + 1);
+}
+
+static uint16_t encode_timeout(uint32_t timeout_mclks)
+{
+    uint32_t ls_byte = 0;
+    uint16_t ms_byte = 0;
+    if (timeout_mclks == 0) {
+        return 0;
+    }
+    ls_byte = timeout_mclks - 1;
+    while ((ls_byte & 0xFFFFFF00u) != 0) {
+        ls_byte >>= 1;
+        ms_byte++;
+    }
+    return (uint16_t)((ms_byte << 8) | (ls_byte & 0xFF));
+}
+
+static uint32_t macro_period_ns(uint8_t vcsel_period_pclks)
+{
+    return (((uint32_t)2304 * vcsel_period_pclks * 1655) + 500) / 1000;
+}
+
+static uint32_t timeout_mclks_to_us(uint16_t timeout_mclks, uint8_t vcsel_period_pclks)
+{
+    uint32_t macro_ns = macro_period_ns(vcsel_period_pclks);
+    return ((timeout_mclks * macro_ns) + 500) / 1000;
+}
+
+static uint32_t timeout_us_to_mclks(uint32_t timeout_us, uint8_t vcsel_period_pclks)
+{
+    uint32_t macro_ns = macro_period_ns(vcsel_period_pclks);
+    return ((timeout_us * 1000) + (macro_ns / 2)) / macro_ns;
+}
+
+static uint8_t decode_vcsel(uint8_t reg_val)
+{
+    return (uint8_t)((reg_val + 1) << 1);
+}
+
+/*
+ * Shrink the final-range step so one shot lasts VL53L0X_TIMING_BUDGET_US.
+ * 20 ms is the shortest budget that still leaves time for the default steps.
+ * VCSEL periods stay at the chip default: shortening them saves a little
+ * current but drops the maximum distance below a typical tank.
+ */
+static esp_err_t set_timing_budget_us(uint32_t budget_us)
+{
+    const uint32_t start_overhead = 1910;
+    const uint32_t end_overhead = 960;
+    const uint32_t msrc_overhead = 660;
+    const uint32_t tcc_overhead = 590;
+    const uint32_t dss_overhead = 690;
+    const uint32_t pre_range_overhead = 660;
+    const uint32_t final_range_overhead = 550;
+
+    if (budget_us < 20000) {
+        budget_us = 20000;
+    }
+
+    uint8_t sequence = 0;
+    uint8_t msrc = 0;
+    uint8_t pre_vcsel_reg = 0;
+    uint8_t final_vcsel_reg = 0;
+    uint16_t pre_timeout_reg = 0;
+    ESP_RETURN_ON_ERROR(read_reg(REG_SYSTEM_SEQUENCE, &sequence), TAG, "budget");
+    ESP_RETURN_ON_ERROR(read_reg(REG_MSRC_TIMEOUT, &msrc), TAG, "budget");
+    ESP_RETURN_ON_ERROR(read_reg(REG_PRE_RANGE_VCSEL, &pre_vcsel_reg), TAG, "budget");
+    ESP_RETURN_ON_ERROR(read_reg(REG_FINAL_RANGE_VCSEL, &final_vcsel_reg), TAG, "budget");
+    ESP_RETURN_ON_ERROR(read_reg16(REG_PRE_RANGE_TIMEOUT, &pre_timeout_reg), TAG, "budget");
+
+    bool tcc = (sequence >> 4) & 0x1;
+    bool dss = (sequence >> 3) & 0x1;
+    bool msrc_en = (sequence >> 2) & 0x1;
+    bool pre_range = (sequence >> 6) & 0x1;
+    bool final_range = (sequence >> 7) & 0x1;
+
+    uint8_t pre_vcsel = decode_vcsel(pre_vcsel_reg);
+    uint8_t final_vcsel = decode_vcsel(final_vcsel_reg);
+    uint32_t msrc_us = timeout_mclks_to_us((uint16_t)msrc + 1, pre_vcsel);
+    uint16_t pre_mclks = decode_timeout(pre_timeout_reg);
+    uint32_t pre_us = timeout_mclks_to_us(pre_mclks, pre_vcsel);
+
+    uint32_t used = start_overhead + end_overhead;
+    if (tcc) {
+        used += msrc_us + tcc_overhead;
+    }
+    if (dss) {
+        used += 2 * (msrc_us + dss_overhead);
+    } else if (msrc_en) {
+        used += msrc_us + msrc_overhead;
+    }
+    if (pre_range) {
+        used += pre_us + pre_range_overhead;
+    }
+    if (!final_range) {
+        return ESP_OK;
+    }
+    used += final_range_overhead;
+    if (used >= budget_us) {
+        ESP_LOGW(TAG, "Timing budget %lu us is too small for the enabled steps", (unsigned long)budget_us);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint32_t final_mclks = timeout_us_to_mclks(budget_us - used, final_vcsel);
+    if (pre_range) {
+        final_mclks += pre_mclks;
+    }
+    ESP_RETURN_ON_ERROR(write_reg16(REG_FINAL_RANGE_TIMEOUT, encode_timeout(final_mclks)), TAG, "budget");
+    ESP_LOGI(TAG, "Timing budget %lu us", (unsigned long)budget_us);
+    return ESP_OK;
 }
 
 static bool timed_out(int64_t start_us, int timeout_ms)
@@ -213,7 +347,7 @@ static esp_err_t sensor_init(void)
     ESP_RETURN_ON_ERROR(write_reg(REG_SYSTEM_SEQUENCE, 0x02), TAG, "phase cal");
     ESP_RETURN_ON_ERROR(ref_calibration(0x00), TAG, "phase cal");
     ESP_RETURN_ON_ERROR(write_reg(REG_SYSTEM_SEQUENCE, 0xE8), TAG, "sequence restore");
-    return ESP_OK;
+    return set_timing_budget_us(VL53L0X_TIMING_BUDGET_US);
 }
 
 static esp_err_t read_single(uint16_t *distance_mm)
@@ -231,7 +365,7 @@ static esp_err_t read_single(uint16_t *distance_mm)
     int64_t start = esp_timer_get_time();
     do {
         ESP_RETURN_ON_ERROR(read_reg(REG_SYSRANGE_START, &tmp), TAG, "range start");
-        if (timed_out(start, 300)) {
+        if (timed_out(start, 50)) {
             return ESP_ERR_TIMEOUT;
         }
     } while (tmp & 0x01);
@@ -239,7 +373,7 @@ static esp_err_t read_single(uint16_t *distance_mm)
     start = esp_timer_get_time();
     do {
         ESP_RETURN_ON_ERROR(read_reg(REG_RESULT_INTERRUPT_STATUS, &tmp), TAG, "range ready");
-        if (timed_out(start, 300)) {
+        if (timed_out(start, (VL53L0X_TIMING_BUDGET_US / 1000) + 30)) {
             return ESP_ERR_TIMEOUT;
         }
     } while ((tmp & 0x07) == 0);
@@ -251,21 +385,36 @@ static esp_err_t read_single(uint16_t *distance_mm)
     return ESP_OK;
 }
 
-static void xshut_prepare(void)
+static void pin_output(gpio_num_t pin, int level)
 {
-    if (!s_gpio_ready) {
-        gpio_config_t cfg = {
-            .pin_bit_mask = 1ULL << VL53L0X_XSHUT_GPIO,
-            .mode = GPIO_MODE_OUTPUT,
-            .pull_up_en = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE,
-        };
-        gpio_config(&cfg);
-        s_gpio_ready = true;
+    gpio_hold_dis(pin);
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << pin,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+    gpio_set_level(pin, level);
+}
+
+static void pin_hold(gpio_num_t pin, int level)
+{
+    pin_output(pin, level);
+    gpio_hold_en(pin);
+}
+
+static void bus_close(void)
+{
+    if (s_dev) {
+        i2c_master_bus_rm_device(s_dev);
+        s_dev = NULL;
     }
-    gpio_hold_dis(VL53L0X_XSHUT_GPIO);
-    gpio_deep_sleep_hold_dis();
+    if (s_bus) {
+        i2c_del_master_bus(s_bus);
+        s_bus = NULL;
+    }
 }
 
 static esp_err_t bus_open(void)
@@ -285,29 +434,48 @@ static esp_err_t bus_open(void)
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = VL53L0X_I2C_ADDR,
-        .scl_speed_hz = 100000,
+        .scl_speed_hz = 400000,
     };
     return i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev);
 }
 
 void vl53l0x_shutdown(void)
 {
-    xshut_prepare();
-    gpio_set_level(VL53L0X_XSHUT_GPIO, 0);
-    gpio_hold_en(VL53L0X_XSHUT_GPIO);
+    bus_close();
+    gpio_deep_sleep_hold_dis();
+    /* I2C lines go low before the supply, so the pull-ups cannot feed the module. */
+    pin_hold(I2C_SDA_GPIO, 0);
+    pin_hold(I2C_SCL_GPIO, 0);
+    pin_hold(VL53L0X_XSHUT_GPIO, 0);
+    pin_hold(VL53L0X_POWER_GPIO, VL53L0X_POWER_ON_LEVEL ? 0 : 1);
     gpio_deep_sleep_hold_en();
 }
 
 esp_err_t vl53l0x_begin(void)
 {
-    xshut_prepare();
-    gpio_set_level(VL53L0X_XSHUT_GPIO, 0);
+    gpio_deep_sleep_hold_dis();
+    gpio_hold_dis(VL53L0X_POWER_GPIO);
+    gpio_hold_dis(VL53L0X_XSHUT_GPIO);
+    gpio_hold_dis(I2C_SDA_GPIO);
+    gpio_hold_dis(I2C_SCL_GPIO);
+
+    /* XSHUT stays low until VIN is valid. The datasheet requires that order. */
+    pin_output(VL53L0X_XSHUT_GPIO, 0);
+    gpio_config_t idle_i2c = {
+        .pin_bit_mask = (1ULL << I2C_SDA_GPIO) | (1ULL << I2C_SCL_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&idle_i2c);
+    pin_output(VL53L0X_POWER_GPIO, VL53L0X_POWER_ON_LEVEL);
     vTaskDelay(pdMS_TO_TICKS(5));
-    gpio_set_level(VL53L0X_XSHUT_GPIO, 1);
-    vTaskDelay(pdMS_TO_TICKS(10));
 
     esp_err_t err = bus_open();
     if (err == ESP_OK) {
+        gpio_set_level(VL53L0X_XSHUT_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(2));
         err = sensor_init();
     }
     if (err != ESP_OK) {

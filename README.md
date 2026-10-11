@@ -10,14 +10,21 @@ Defaults are in `main/app_config.h`.
 
 | Function | GPIO | Notes |
 | --- | --- | --- |
-| VL53L0X SDA | 10 | 3.3 V I2C. Most modules already have pull-ups. |
-| VL53L0X SCL | 11 | |
-| VL53L0X XSHUT | 12 | Held low during deep sleep so the sensor stays in standby. |
+| VL53L0X SDA | 10 | 3.3 V I2C. Driven low during deep sleep so it cannot feed the unpowered module. |
+| VL53L0X SCL | 11 | Same as SDA. |
+| VL53L0X XSHUT | 12 | Released only while a reading is in progress. |
+| VL53L0X power | 14 | High enables a high-side load switch for the module VIN. Held low in deep sleep. |
 | Battery ADC | 1 | Middle node of the divider. |
 | Divider sink | 3 | Bottom resistor returns here, not to GND. Driven low only while sampling. Set `BATTERY_SINK_GPIO` to `-1` if the resistor is tied to GND. |
 | Reset button | 13 | To GND. Wakes the chip and factory-resets the Zigbee network. |
 
-VL53L0X VIN and GND go to 3.3 V and ground. Mount the sensor above the water, looking down.
+Do not tie VL53L0X VIN straight to 3.3 V. GPIO14 switches it through a load switch, and only for the reading. Ranging draws about 20 mA, so the module must not be powered from the GPIO pin itself. Each shot uses a 20 ms timing budget (`VL53L0X_TIMING_BUDGET_US`), which is as short as this sensor allows without giving up the default ranging steps. Mount the sensor above the water, looking down.
+
+```text
+3V3 ---- load switch ---- VL53L0X VIN
+              |
+            GPIO14 (high = on)
+```
 
 Battery divider, for a single Li-ion cell and the default 1:1 resistors (100 kΩ / 100 kΩ):
 
