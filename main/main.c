@@ -90,7 +90,7 @@ static void report_timer_cb(void *arg)
     esp_zigbee_lock_acquire(portMAX_DELAY);
     bool reported = false;
     if (s_report_due) {
-        reported = water_send_tuya_report();
+        reported = water_send_level_report();
     }
     water_send_battery_report();
     esp_zigbee_lock_release();
@@ -373,5 +373,5 @@ void app_main(void)
     create_timers();
     water_set_activity_callback(on_zigbee_activity);
     schedule_sleep(90);
-    xTaskCreate(zigbee_task, "zigbee", 8192, NULL, 5, NULL);
+    xTaskCreate(zigbee_task, "zigbee", 12288, NULL, 5, NULL);
 }

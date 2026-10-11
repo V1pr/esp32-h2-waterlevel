@@ -1,6 +1,6 @@
 # ESP32-H2 tank water level
 
-Battery-powered water level sensor. An ESP32-H2 reads a VL53L0X time-of-flight sensor over I2C and reports to Zigbee as a Tuya **872WZ** (`TS0601`, manufacturer `_TZE204_7yyuo8sr`), which zigbee2mqtt already knows.
+Battery-powered water level sensor. An ESP32-H2 reads a VL53L0X time-of-flight sensor over I2C and reports to Zigbee as a **Bacchus Water level meter**, which stock zigbee2mqtt already knows. No external converter is required.
 
 The chip sleeps in deep sleep between readings. It wakes every minute, measures, and turns the radio on only when the level has moved by more than 0.5 cm or 15 minutes have passed since the last report. Those two periods are `MEASURE_INTERVAL_SEC`, `REPORT_INTERVAL_SEC`, and `LEVEL_CHANGE_THRESHOLD_CM` at the top of `main/app_config.h`.
 
@@ -33,15 +33,15 @@ pack+ ---- Rhigh ----+---- GPIO1 (ADC)
 
 ## Tank size
 
-Until you set them from zigbee2mqtt, installation height and maximum depth are both 1.00 m.
+Until you set it from zigbee2mqtt, tank height is 100 cm.
 
-* **installation_height** is the distance from the sensor to the bottom of the tank.
-* **liquid_depth_max** is the water depth that should read as 100%.
-* **min_set** / **max_set** are the percent thresholds for `liquid_state` `low` and `high`.
+**tank_height** is the distance from the sensor to the bottom of the tank. `water_level` is that height minus the distance the VL53L0X measures, shown in centimeters (0.1 cm steps). `filling` is `water_level / tank_height`, in percent.
 
-`liquid_depth` is `installation_height` minus the distance the VL53L0X measures. zigbee2mqtt shows it in meters. The device sends centimeters, which is what the current 872WZ converter expects (`value / 100 = meters`).
+`alarm_min_threshold` and `alarm_max_threshold` are stored so the Bacchus controls round-trip. This board has no alarm output. `invert_threshold` is stored the same way.
 
-`silent_mode` and `alarm_duration` are stored and reported so the 872WZ controls round-trip, but this board has no buzzer.
+`measurment_period` (zigbee2mqtt spells it that way) is stored and defaults to 15 minutes. It does not change the sleep schedule. Wake and transmit times stay `MEASURE_INTERVAL_SEC`, `REPORT_INTERVAL_SEC`, and `LEVEL_CHANGE_THRESHOLD_CM` in `main/app_config.h`.
+
+`out_of_service` is true when the VL53L0X has no valid target. The Bacchus profile also exposes `temperature`; this board has no temperature sensor, so that entity stays at 0 °C. `battery` and `voltage` come from the standard Power Configuration cluster.
 
 ## Build (ESP-IDF on Windows)
 
@@ -60,11 +60,9 @@ Replace `COM5` with the board's port. The monitor shows a boot every minute. Whe
 
 1. In zigbee2mqtt, permit joining.
 2. Power the board. The first boot (and any later boot that has not joined) turns the radio on and steers.
-3. The device interviews as **Tuya 872WZ**.
+3. The device interviews as **Bacchus Water level meter**.
 
-`liquid_state`, `liquid_level_percent`, and `liquid_depth` publish with the stock zigbee2mqtt definition. No custom converter is required for the water level.
-
-The real 872WZ is defined as a mains-powered device, so stock zigbee2mqtt does not publish its battery. This firmware still reports battery voltage and percentage on the standard Power Configuration cluster. To see them in MQTT, copy `z2m/872WZ-battery.js` to `data/external_converters/` and restart zigbee2mqtt. That file is the 872WZ profile plus battery.
+`water_level`, `filling`, `battery`, and `voltage` publish from the stock definition. If this board was previously paired as a Tuya 872WZ, remove that device in zigbee2mqtt and pair it again. The model identifier has changed.
 
 Hold the GPIO13 button to wake the chip and erase the Zigbee network, then permit join again. Do not use the BOOT button (GPIO9) for this; holding it during reset enters the ROM download mode.
 

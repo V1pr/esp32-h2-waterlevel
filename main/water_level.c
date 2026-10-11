@@ -12,25 +12,22 @@
 static const char *TAG = "water";
 
 #define NVS_NAMESPACE "water"
-#define TUYA_CLUSTER_ID 0xEF00
-#define TUYA_BOOL 0x01
-#define TUYA_VALUE 0x02
-#define TUYA_ENUM 0x04
-#define CMD_DATA_REQUEST 0x00
-#define CMD_DATA_RESPONSE 0x01
-#define CMD_DATA_REPORT 0x02
-#define CMD_DATA_QUERY 0x03
-#define CMD_SEND_DATA 0x04
-#define CMD_MCU_VERSION_REQ 0x10
-#define CMD_MCU_VERSION_RSP 0x11
+
+/* Bacchus custom attributes. zigbee2mqtt reads these without a manufacturer code. */
+#define ATTR_TANK_HEIGHT 0xF005
+#define ATTR_FILLING 0xF006
+#define ATTR_MEASURE_PERIOD 0xF007
+#define ATTR_INVERT 0xF008
+
+#define ACCESS_STATE (EZB_ZCL_ATTR_ACCESS_READ | EZB_ZCL_ATTR_ACCESS_REPORTING)
+#define ACCESS_SETTING (EZB_ZCL_ATTR_ACCESS_READ | EZB_ZCL_ATTR_ACCESS_WRITE)
 
 typedef struct {
-    uint16_t installation_cm;
-    uint16_t depth_max_cm;
-    uint8_t max_set;
-    uint8_t min_set;
-    uint8_t silent;
+    uint16_t height_cm;
     uint8_t alarm_min;
+    uint8_t alarm_max;
+    uint8_t invert;
+    uint16_t period_min;
     uint8_t joined;
 } settings_t;
 
@@ -40,9 +37,21 @@ static int32_t s_distance_mm;
 static bool s_distance_valid;
 static uint8_t s_batt_pct_zcl;
 static uint8_t s_batt_volt_zcl;
-static uint16_t s_seq;
 static water_activity_cb_t s_activity;
-static uint8_t s_frames[3][48];
+static bool s_applying_write;
+
+static float s_present_mm;
+static uint8_t s_out_of_service;
+static uint8_t s_status_flags;
+static float s_alarm_min;
+static float s_alarm_max;
+static float s_tank_height_mm;
+static float s_filling;
+static uint16_t s_period_min;
+static uint8_t s_invert;
+static int16_t s_temperature;
+static uint8_t s_manufacturer[1 + sizeof(ZIGBEE_MANUFACTURER_TEXT)];
+static uint8_t s_model[1 + sizeof(ZIGBEE_MODEL_TEXT)];
 
 static void save_settings(void)
 {
@@ -50,23 +59,57 @@ static void save_settings(void)
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
         return;
     }
-    nvs_set_u16(handle, "install", s_cfg.installation_cm);
-    nvs_set_u16(handle, "maxdepth", s_cfg.depth_max_cm);
-    nvs_set_u8(handle, "maxset", s_cfg.max_set);
-    nvs_set_u8(handle, "minset", s_cfg.min_set);
-    nvs_set_u8(handle, "silent", s_cfg.silent);
-    nvs_set_u8(handle, "alarm", s_cfg.alarm_min);
+    nvs_set_u16(handle, "height", s_cfg.height_cm);
+    nvs_set_u8(handle, "maxpct", s_cfg.alarm_max);
+    nvs_set_u8(handle, "minpct", s_cfg.alarm_min);
+    nvs_set_u8(handle, "invert", s_cfg.invert);
+    nvs_set_u16(handle, "period", s_cfg.period_min);
     nvs_set_u8(handle, "joined", s_cfg.joined);
     nvs_commit(handle);
     nvs_close(handle);
 }
 
-static uint8_t clamp_u8(uint32_t value, uint8_t max_value)
+static uint8_t clamp_percent(int value)
 {
-    if (value > max_value) {
-        return max_value;
+    if (value < 0) {
+        return 0;
+    }
+    if (value > 100) {
+        return 100;
     }
     return (uint8_t)value;
+}
+
+static uint16_t clamp_height_cm(int value)
+{
+    if (value < 0) {
+        return 0;
+    }
+    if (value > 450) {
+        return 450;
+    }
+    return (uint16_t)value;
+}
+
+static int round_to_int(float value)
+{
+    if (value >= 0.0f) {
+        return (int)(value + 0.5f);
+    }
+    return (int)(value - 0.5f);
+}
+
+static void sync_zcl_values(void)
+{
+    s_present_mm = s_sample.distance_valid ? (float)s_sample.depth_mm : 0.0f;
+    s_out_of_service = s_sample.distance_valid ? 0 : 1;
+    s_status_flags = s_out_of_service ? EZB_ZCL_ANALOG_INPUT_STATUS_FLAGS_OUT_OF_SERVICE : 0;
+    s_filling = (float)s_sample.percent;
+    s_tank_height_mm = (float)s_cfg.height_cm * 10.0f;
+    s_alarm_min = (float)s_cfg.alarm_min;
+    s_alarm_max = (float)s_cfg.alarm_max;
+    s_period_min = s_cfg.period_min;
+    s_invert = s_cfg.invert ? 1 : 0;
 }
 
 static void recompute(void)
@@ -79,18 +122,18 @@ static void recompute(void)
 
     int32_t depth_mm = 0;
     if (s_distance_valid) {
-        depth_mm = (int32_t)s_cfg.installation_cm * 10 - s_distance_mm;
+        depth_mm = (int32_t)s_cfg.height_cm * 10 - s_distance_mm;
         if (depth_mm < 0) {
             depth_mm = 0;
         }
     }
     s_sample.depth_mm = depth_mm;
 
-    int32_t max_mm = (int32_t)s_cfg.depth_max_cm * 10;
-    if (max_mm < 1) {
-        max_mm = 1;
+    int32_t full_mm = (int32_t)s_cfg.height_cm * 10;
+    if (full_mm < 1) {
+        full_mm = 1;
     }
-    int percent = (int)(depth_mm * 100 / max_mm);
+    int percent = (int)(depth_mm * 100 / full_mm);
     if (percent > 100) {
         percent = 100;
     }
@@ -98,39 +141,64 @@ static void recompute(void)
         percent = 0;
     }
     s_sample.percent = (uint8_t)percent;
+    sync_zcl_values();
+}
 
-    if (s_sample.percent <= s_cfg.min_set) {
-        s_sample.liquid_state = 1;
-    } else if (s_sample.percent >= s_cfg.max_set) {
-        s_sample.liquid_state = 2;
-    } else {
-        s_sample.liquid_state = 0;
+static bool nvs_u16(nvs_handle_t handle, const char *key, uint16_t *dest)
+{
+    uint16_t value = 0;
+    if (nvs_get_u16(handle, key, &value) != ESP_OK) {
+        return false;
     }
+    *dest = value;
+    return true;
+}
+
+static bool nvs_u8(nvs_handle_t handle, const char *key, uint8_t *dest)
+{
+    uint8_t value = 0;
+    if (nvs_get_u8(handle, key, &value) != ESP_OK) {
+        return false;
+    }
+    *dest = value;
+    return true;
 }
 
 void water_settings_init(void)
 {
-    s_cfg.installation_cm = DEFAULT_INSTALLATION_HEIGHT_CM;
-    s_cfg.depth_max_cm = DEFAULT_LIQUID_DEPTH_MAX_CM;
-    s_cfg.max_set = DEFAULT_MAX_SET_PERCENT;
-    s_cfg.min_set = DEFAULT_MIN_SET_PERCENT;
-    s_cfg.silent = 0;
-    s_cfg.alarm_min = DEFAULT_ALARM_MINUTES;
+    s_cfg.height_cm = DEFAULT_TANK_HEIGHT_CM;
+    s_cfg.alarm_max = DEFAULT_ALARM_MAX_PERCENT;
+    s_cfg.alarm_min = DEFAULT_ALARM_MIN_PERCENT;
+    s_cfg.invert = 0;
+    s_cfg.period_min = (uint16_t)(REPORT_INTERVAL_SEC / 60u);
     s_cfg.joined = 0;
+    s_temperature = 0;
 
     nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK) {
-        nvs_get_u16(handle, "install", &s_cfg.installation_cm);
-        nvs_get_u16(handle, "maxdepth", &s_cfg.depth_max_cm);
-        nvs_get_u8(handle, "maxset", &s_cfg.max_set);
-        nvs_get_u8(handle, "minset", &s_cfg.min_set);
-        nvs_get_u8(handle, "silent", &s_cfg.silent);
-        nvs_get_u8(handle, "alarm", &s_cfg.alarm_min);
-        nvs_get_u8(handle, "joined", &s_cfg.joined);
+        if (!nvs_u16(handle, "height", &s_cfg.height_cm)) {
+            /* Earlier firmware stored the sensor height as "install". */
+            nvs_u16(handle, "install", &s_cfg.height_cm);
+        }
+        if (!nvs_u8(handle, "maxpct", &s_cfg.alarm_max)) {
+            nvs_u8(handle, "maxset", &s_cfg.alarm_max);
+        }
+        if (!nvs_u8(handle, "minpct", &s_cfg.alarm_min)) {
+            nvs_u8(handle, "minset", &s_cfg.alarm_min);
+        }
+        nvs_u8(handle, "invert", &s_cfg.invert);
+        nvs_u16(handle, "period", &s_cfg.period_min);
+        nvs_u8(handle, "joined", &s_cfg.joined);
         nvs_close(handle);
     }
-    ESP_LOGI(TAG, "Tank install %u cm, max depth %u cm, low %u%%, high %u%%", s_cfg.installation_cm,
-             s_cfg.depth_max_cm, s_cfg.min_set, s_cfg.max_set);
+    s_cfg.height_cm = clamp_height_cm(s_cfg.height_cm);
+    s_cfg.alarm_min = clamp_percent(s_cfg.alarm_min);
+    s_cfg.alarm_max = clamp_percent(s_cfg.alarm_max);
+    if (s_cfg.period_min > 3600) {
+        s_cfg.period_min = 3600;
+    }
+    sync_zcl_values();
+    ESP_LOGI(TAG, "Tank height %u cm, alarm %u-%u%%", s_cfg.height_cm, s_cfg.alarm_min, s_cfg.alarm_max);
 }
 
 bool water_network_joined(void)
@@ -159,8 +227,8 @@ void water_set_reading(bool distance_valid, int32_t distance_mm, uint8_t battery
     s_batt_pct_zcl = (uint8_t)(battery_percent * 2);
     s_batt_volt_zcl = (uint8_t)(battery_mv / 100);
     recompute();
-    ESP_LOGI(TAG, "Distance %ld mm, depth %ld mm (%u%%, state %u)", (long)s_sample.distance_mm,
-             (long)s_sample.depth_mm, s_sample.percent, s_sample.liquid_state);
+    ESP_LOGI(TAG, "Distance %ld mm, depth %ld mm (%u%%)", (long)s_sample.distance_mm, (long)s_sample.depth_mm,
+             s_sample.percent);
 }
 
 const water_sample_t *water_sample(void)
@@ -168,132 +236,17 @@ const water_sample_t *water_sample(void)
     return &s_sample;
 }
 
-static size_t put_header(uint8_t *buf, size_t n, uint8_t dp, uint8_t type, uint8_t len)
+static void set_server_attr(uint16_t cluster, uint16_t attr, const void *value)
 {
-    buf[n++] = dp;
-    buf[n++] = type;
-    buf[n++] = 0x00;
-    buf[n++] = len;
-    return n;
-}
-
-static size_t put_value(uint8_t *buf, size_t n, uint8_t dp, uint32_t value)
-{
-    n = put_header(buf, n, dp, TUYA_VALUE, 4);
-    buf[n++] = (uint8_t)(value >> 24);
-    buf[n++] = (uint8_t)(value >> 16);
-    buf[n++] = (uint8_t)(value >> 8);
-    buf[n++] = (uint8_t)value;
-    return n;
-}
-
-static size_t put_enum(uint8_t *buf, size_t n, uint8_t dp, uint8_t value)
-{
-    n = put_header(buf, n, dp, TUYA_ENUM, 1);
-    buf[n++] = value;
-    return n;
-}
-
-static size_t put_bool(uint8_t *buf, size_t n, uint8_t dp, uint8_t value)
-{
-    n = put_header(buf, n, dp, TUYA_BOOL, 1);
-    buf[n++] = value ? 1 : 0;
-    return n;
-}
-
-static uint32_t depth_centimeters(void)
-{
-    /* Nearest centimeter. zigbee2mqtt divides this by 100 and shows meters. */
-    if (!s_sample.distance_valid) {
-        return 0;
+    ezb_zcl_attr_desc_t desc = ezb_zcl_get_attr_desc(ZIGBEE_ENDPOINT, cluster, EZB_ZCL_CLUSTER_SERVER, attr,
+                                                     EZB_ZCL_STD_MANUF_CODE);
+    if (desc) {
+        ezb_zcl_attr_desc_set_value(desc, value);
     }
-    int32_t cm = (s_sample.depth_mm + 5) / 10;
-    if (cm < 0) {
-        cm = 0;
-    }
-    return (uint32_t)cm;
 }
 
-static esp_err_t send_frame(uint8_t cmd, uint16_t seq, const uint8_t *body, size_t body_len, uint8_t *storage)
+static bool report_attr(uint16_t cluster, uint16_t attr)
 {
-    storage[0] = (uint8_t)(seq & 0xff);
-    storage[1] = (uint8_t)((seq >> 8) & 0xff);
-    memcpy(&storage[2], body, body_len);
-
-    ezb_zcl_custom_cluster_cmd_t req = {
-        .cmd_ctrl =
-            {
-                .dst_addr =
-                    {
-                        .addr_mode = EZB_ADDR_MODE_SHORT,
-                        .u.short_addr = 0x0000,
-                    },
-                .src_ep = ZIGBEE_ENDPOINT,
-                .dst_ep = 1,
-                .cluster_id = TUYA_CLUSTER_ID,
-                .fc =
-                    {
-                        .direction = EZB_ZCL_CMD_DIRECTION_TO_CLI,
-                        .dis_default_rsp = (cmd == CMD_DATA_RESPONSE) ? 1 : 0,
-                    },
-            },
-        .cmd_id = cmd,
-        .data_length = (uint16_t)(body_len + 2),
-        .data = storage,
-    };
-    ezb_err_t ret = ezb_zcl_custom_cluster_cmd_req(&req);
-    if (ret != EZB_ERR_NONE) {
-        ESP_LOGW(TAG, "Tuya command 0x%02x failed (0x%04x)", cmd, ret);
-        return ESP_FAIL;
-    }
-    return ESP_OK;
-}
-
-static bool send_all(uint8_t cmd, uint16_t seq)
-{
-    uint8_t body[40];
-    size_t n = 0;
-    bool ok = true;
-
-    n = put_enum(body, 0, DP_LIQUID_STATE, s_sample.liquid_state);
-    n = put_value(body, n, DP_LIQUID_DEPTH, depth_centimeters());
-    n = put_value(body, n, DP_LIQUID_LEVEL_PERCENT, s_sample.percent);
-    ok = send_frame(cmd, seq, body, n, s_frames[0]) == ESP_OK && ok;
-
-    n = put_value(body, 0, DP_MAX_SET, s_cfg.max_set);
-    n = put_value(body, n, DP_MIN_SET, s_cfg.min_set);
-    n = put_value(body, n, DP_INSTALLATION_HEIGHT, s_cfg.installation_cm);
-    n = put_value(body, n, DP_LIQUID_DEPTH_MAX, s_cfg.depth_max_cm);
-    ok = send_frame(cmd, (uint16_t)(seq + 1), body, n, s_frames[1]) == ESP_OK && ok;
-
-    n = put_bool(body, 0, DP_SILENT_MODE, s_cfg.silent);
-    n = put_value(body, n, DP_ALARM_TIME, s_cfg.alarm_min);
-    ok = send_frame(cmd, (uint16_t)(seq + 2), body, n, s_frames[2]) == ESP_OK && ok;
-
-    s_seq = (uint16_t)(seq + 3);
-    return ok;
-}
-
-bool water_send_tuya_report(void)
-{
-    ESP_LOGI(TAG, "Reporting depth %lu cm, %u%%", (unsigned long)depth_centimeters(), s_sample.percent);
-    return send_all(CMD_DATA_REPORT, s_seq);
-}
-
-void water_send_battery_report(void)
-{
-    ezb_zcl_attr_desc_t percent = ezb_zcl_get_attr_desc(ZIGBEE_ENDPOINT, EZB_ZCL_CLUSTER_ID_POWER_CONFIG, EZB_ZCL_CLUSTER_SERVER,
-                                                        EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
-                                                        EZB_ZCL_STD_MANUF_CODE);
-    ezb_zcl_attr_desc_t voltage = ezb_zcl_get_attr_desc(ZIGBEE_ENDPOINT, EZB_ZCL_CLUSTER_ID_POWER_CONFIG, EZB_ZCL_CLUSTER_SERVER,
-                                                        EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID, EZB_ZCL_STD_MANUF_CODE);
-    if (percent) {
-        ezb_zcl_attr_desc_set_value(percent, &s_batt_pct_zcl);
-    }
-    if (voltage) {
-        ezb_zcl_attr_desc_set_value(voltage, &s_batt_volt_zcl);
-    }
-
     ezb_zcl_report_attr_cmd_t report = {
         .cmd_ctrl =
             {
@@ -302,148 +255,144 @@ void water_send_battery_report(void)
                 .dst_addr.u.short_addr = 0x0000,
                 .src_ep = ZIGBEE_ENDPOINT,
                 .dst_ep = 1,
-                .cluster_id = EZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+                .cluster_id = cluster,
             },
-        .payload.attr_id = EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
+        .payload.attr_id = attr,
     };
     ezb_err_t ret = ezb_zcl_report_attr_cmd_req(&report);
     if (ret != EZB_ERR_NONE) {
-        ESP_LOGW(TAG, "Battery report failed (0x%04x)", ret);
-    } else {
-        ESP_LOGI(TAG, "Battery report %u%%", s_sample.battery_percent);
+        ESP_LOGW(TAG, "Report cluster 0x%04x attr 0x%04x failed (0x%04x)", cluster, attr, ret);
+        return false;
     }
+    return true;
 }
 
-static uint32_t read_be32(const uint8_t *data)
+bool water_send_level_report(void)
 {
-    return ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | data[3];
+    sync_zcl_values();
+    set_server_attr(EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &s_present_mm);
+    set_server_attr(EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, EZB_ZCL_ATTR_ANALOG_INPUT_OUT_OF_SERVICE_ID, &s_out_of_service);
+    set_server_attr(EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, EZB_ZCL_ATTR_ANALOG_INPUT_STATUS_FLAGS_ID, &s_status_flags);
+    set_server_attr(EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ATTR_FILLING, &s_filling);
+
+    ESP_LOGI(TAG, "Reporting %.1f cm, %u%%", s_present_mm / 10.0f, s_sample.percent);
+    bool level = report_attr(EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID);
+    bool filling = report_attr(EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ATTR_FILLING);
+    bool service = report_attr(EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, EZB_ZCL_ATTR_ANALOG_INPUT_OUT_OF_SERVICE_ID);
+    return level && filling && service;
 }
 
-static void apply_dp(uint8_t dp, uint8_t datatype, const uint8_t *data, uint16_t len)
+void water_send_battery_report(void)
 {
-    if (datatype == TUYA_VALUE && len == 4) {
-        uint32_t value = read_be32(data);
-        switch (dp) {
-        case DP_MAX_SET:
-            s_cfg.max_set = clamp_u8(value, 100);
-            break;
-        case DP_MIN_SET:
-            s_cfg.min_set = clamp_u8(value, 100);
-            break;
-        case DP_INSTALLATION_HEIGHT:
-            s_cfg.installation_cm = value > 500 ? 500 : (uint16_t)value;
-            break;
-        case DP_LIQUID_DEPTH_MAX:
-            s_cfg.depth_max_cm = value > 500 ? 500 : (uint16_t)value;
-            break;
-        case DP_ALARM_TIME:
-            if (value < 1) {
-                value = 1;
-            }
-            s_cfg.alarm_min = clamp_u8(value, 60);
-            break;
-        default:
-            ESP_LOGI(TAG, "Ignoring value dp %u = %lu", dp, (unsigned long)value);
-            return;
-        }
-        ESP_LOGI(TAG, "Set dp %u = %lu", dp, (unsigned long)value);
-    } else if (datatype == TUYA_BOOL && len >= 1 && dp == DP_SILENT_MODE) {
-        s_cfg.silent = data[0] ? 1 : 0;
-        ESP_LOGI(TAG, "Silent mode %u", s_cfg.silent);
-    } else {
-        ESP_LOGI(TAG, "Ignoring dp %u type %u len %u", dp, datatype, len);
-    }
+    set_server_attr(EZB_ZCL_CLUSTER_ID_POWER_CONFIG, EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
+                    &s_batt_pct_zcl);
+    set_server_attr(EZB_ZCL_CLUSTER_ID_POWER_CONFIG, EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID, &s_batt_volt_zcl);
+    report_attr(EZB_ZCL_CLUSTER_ID_POWER_CONFIG, EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID);
+    report_attr(EZB_ZCL_CLUSTER_ID_POWER_CONFIG, EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID);
+    ESP_LOGI(TAG, "Battery report %u%%, %u mV", s_sample.battery_percent, s_sample.battery_mv);
 }
 
-static void parse_datapoints(const uint8_t *payload, uint16_t len)
+static void push_setting(uint16_t cluster, uint16_t attr, const void *value)
 {
-    size_t i = 2;
-    while (i + 4 <= len) {
-        uint8_t dp = payload[i];
-        uint8_t type = payload[i + 1];
-        uint16_t dlen = (uint16_t)((payload[i + 2] << 8) | payload[i + 3]);
-        i += 4;
-        if (i + dlen > len) {
-            break;
-        }
-        apply_dp(dp, type, &payload[i], dlen);
-        i += dlen;
-    }
-    save_settings();
-    recompute();
+    s_applying_write = true;
+    set_server_attr(cluster, attr, value);
+    s_applying_write = false;
 }
 
-static ezb_zcl_status_t on_tuya_command(const ezb_zcl_cmd_hdr_t *header, const uint8_t *payload, uint16_t payload_length)
+static void on_attr_write(ezb_zcl_set_attr_value_message_t *message)
 {
-    if (!header || header->cluster_id != TUYA_CLUSTER_ID) {
-        return EZB_ZCL_STATUS_UNSUP_CMD;
+    if (!message || !message->in.attribute.data.value || s_applying_write) {
+        return;
     }
     if (s_activity) {
         s_activity();
     }
 
-    ESP_LOGI(TAG, "Tuya command 0x%02x, %u bytes", header->cmd_id, payload_length);
+    uint16_t cluster = message->info.cluster_id;
+    uint16_t attr = message->in.attribute.id;
+    const void *raw = message->in.attribute.data.value;
+    bool stored = false;
 
-    if (header->cmd_id == CMD_MCU_VERSION_REQ) {
-        uint16_t seq = 0;
-        if (payload && payload_length >= 2) {
-            seq = (uint16_t)(payload[0] | (payload[1] << 8));
+    if (cluster == EZB_ZCL_CLUSTER_ID_ANALOG_INPUT && attr == ATTR_TANK_HEIGHT &&
+        message->in.attribute.data.size >= sizeof(float)) {
+        float written = 0.0f;
+        memcpy(&written, raw, sizeof(written));
+        s_cfg.height_cm = clamp_height_cm(round_to_int(written / 10.0f));
+        stored = true;
+        ESP_LOGI(TAG, "Tank height %u cm", s_cfg.height_cm);
+    } else if (cluster == EZB_ZCL_CLUSTER_ID_ANALOG_INPUT &&
+               (attr == EZB_ZCL_ATTR_ANALOG_INPUT_MIN_PRESENT_VALUE_ID ||
+                attr == EZB_ZCL_ATTR_ANALOG_INPUT_MAX_PRESENT_VALUE_ID) &&
+               message->in.attribute.data.size >= sizeof(float)) {
+        float written = 0.0f;
+        memcpy(&written, raw, sizeof(written));
+        uint8_t percent = clamp_percent(round_to_int(written));
+        if (attr == EZB_ZCL_ATTR_ANALOG_INPUT_MIN_PRESENT_VALUE_ID) {
+            s_cfg.alarm_min = percent;
+        } else {
+            s_cfg.alarm_max = percent;
         }
-        uint8_t body[1] = {0x01};
-        /* Version response is seq + one version byte, not a datapoint list. */
-        uint8_t frame[3] = {(uint8_t)(seq & 0xff), (uint8_t)((seq >> 8) & 0xff), body[0]};
-        ezb_zcl_custom_cluster_cmd_t req = {
-            .cmd_ctrl =
-                {
-                    .dst_addr = header->src_addr,
-                    .src_ep = header->dst_ep,
-                    .dst_ep = header->src_ep ? header->src_ep : 1,
-                    .cluster_id = TUYA_CLUSTER_ID,
-                    .fc.direction = EZB_ZCL_CMD_DIRECTION_TO_CLI,
-                    .fc.dis_default_rsp = 1,
-                },
-            .cmd_id = CMD_MCU_VERSION_RSP,
-            .data_length = sizeof(frame),
-            .data = frame,
-        };
-        static uint8_t version_frame[3];
-        memcpy(version_frame, frame, sizeof(frame));
-        req.data = version_frame;
-        ezb_zcl_custom_cluster_cmd_req(&req);
-        return EZB_ZCL_STATUS_SUCCESS;
-    }
-
-    if (header->cmd_id == CMD_DATA_QUERY) {
-        send_all(CMD_DATA_RESPONSE, s_seq);
-        return EZB_ZCL_STATUS_SUCCESS;
-    }
-
-    if (header->cmd_id == CMD_DATA_REQUEST || header->cmd_id == CMD_SEND_DATA) {
-        if (!payload || payload_length < 2) {
-            return EZB_ZCL_STATUS_INVALID_VALUE;
+        stored = true;
+        ESP_LOGI(TAG, "Alarm thresholds %u-%u%%", s_cfg.alarm_min, s_cfg.alarm_max);
+    } else if (cluster == EZB_ZCL_CLUSTER_ID_ANALOG_INPUT && attr == ATTR_MEASURE_PERIOD &&
+               message->in.attribute.data.size >= sizeof(uint16_t)) {
+        uint16_t minutes = 0;
+        memcpy(&minutes, raw, sizeof(minutes));
+        if (minutes > 3600) {
+            minutes = 3600;
         }
-        uint16_t seq = (uint16_t)(payload[0] | (payload[1] << 8));
-        parse_datapoints(payload, payload_length);
-        send_all(CMD_DATA_RESPONSE, seq);
-        return EZB_ZCL_STATUS_SUCCESS;
+        s_cfg.period_min = minutes;
+        stored = true;
+        ESP_LOGI(TAG, "Stored measurement period %u min", s_cfg.period_min);
+    } else if (cluster == EZB_ZCL_CLUSTER_ID_ON_OFF && attr == ATTR_INVERT &&
+               message->in.attribute.data.size >= sizeof(uint8_t)) {
+        s_cfg.invert = (*(const uint8_t *)raw) ? 1 : 0;
+        stored = true;
+        ESP_LOGI(TAG, "Invert threshold %u", s_cfg.invert);
     }
 
-    return EZB_ZCL_STATUS_UNSUP_CMD;
+    if (!stored) {
+        return;
+    }
+    save_settings();
+    recompute();
+    push_setting(EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ATTR_TANK_HEIGHT, &s_tank_height_mm);
+    push_setting(EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, EZB_ZCL_ATTR_ANALOG_INPUT_MIN_PRESENT_VALUE_ID, &s_alarm_min);
+    push_setting(EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, EZB_ZCL_ATTR_ANALOG_INPUT_MAX_PRESENT_VALUE_ID, &s_alarm_max);
+    push_setting(EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ATTR_MEASURE_PERIOD, &s_period_min);
+    push_setting(EZB_ZCL_CLUSTER_ID_ON_OFF, ATTR_INVERT, &s_invert);
+    set_server_attr(EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &s_present_mm);
+    set_server_attr(EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ATTR_FILLING, &s_filling);
 }
 
-static void tuya_cluster_init(uint8_t ep_id)
+static void zcl_core_action(ezb_zcl_core_action_callback_id_t callback_id, void *message)
 {
-    (void)ep_id;
-    ezb_zcl_custom_cluster_handlers_t handlers = {
-        .cluster_id = TUYA_CLUSTER_ID,
-        .cluster_role = EZB_ZCL_CLUSTER_SERVER,
-        .process_cmd_cb = on_tuya_command,
-    };
-    ezb_zcl_custom_cluster_handlers_register(&handlers);
+    if (callback_id == EZB_ZCL_CORE_SET_ATTR_VALUE_CB_ID) {
+        on_attr_write((ezb_zcl_set_attr_value_message_t *)message);
+    }
+}
+
+static void put_zcl_string(uint8_t *dst, const char *text)
+{
+    size_t length = strlen(text);
+    dst[0] = (uint8_t)length;
+    memcpy(&dst[1], text, length);
+}
+
+static void force_access(ezb_zcl_cluster_desc_t cluster, uint16_t attr_id, uint8_t access)
+{
+    ezb_zcl_attr_desc_t attr = ezb_zcl_cluster_get_attr_desc(cluster, attr_id, EZB_ZCL_STD_MANUF_CODE);
+    if (attr) {
+        ezb_zcl_attr_desc_set_access(attr, access);
+    }
 }
 
 esp_err_t water_zigbee_device_create(void)
 {
+    sync_zcl_values();
+    put_zcl_string(s_manufacturer, ZIGBEE_MANUFACTURER_TEXT);
+    put_zcl_string(s_model, ZIGBEE_MODEL_TEXT);
+
     ezb_af_device_desc_t dev = ezb_af_create_device_desc();
 
     ezb_zcl_basic_cluster_server_config_t basic_cfg = {
@@ -451,19 +400,49 @@ esp_err_t water_zigbee_device_create(void)
         .power_source = EZB_ZCL_BASIC_POWER_SOURCE_BATTERY,
     };
     ezb_zcl_cluster_desc_t basic = ezb_zcl_basic_create_cluster_desc(&basic_cfg, EZB_ZCL_CLUSTER_SERVER);
-    ezb_zcl_basic_cluster_desc_add_attr(basic, EZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, (void *)ZIGBEE_MANUFACTURER);
-    ezb_zcl_basic_cluster_desc_add_attr(basic, EZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, (void *)ZIGBEE_MODEL);
+    ezb_zcl_basic_cluster_desc_add_attr(basic, EZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, s_manufacturer);
+    ezb_zcl_basic_cluster_desc_add_attr(basic, EZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, s_model);
 
     ezb_zcl_cluster_desc_t power = ezb_zcl_power_config_create_cluster_desc(NULL, EZB_ZCL_CLUSTER_SERVER);
     ezb_zcl_power_config_cluster_desc_add_attr(power, EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID, &s_batt_volt_zcl);
     ezb_zcl_power_config_cluster_desc_add_attr(power, EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
                                                &s_batt_pct_zcl);
 
-    ezb_zcl_custom_cluster_config_t tuya_cfg = {
-        .cluster_id = TUYA_CLUSTER_ID,
-        .init_func = tuya_cluster_init,
+    ezb_zcl_analog_input_cluster_server_config_t analog_cfg = {
+        .out_of_service = s_out_of_service != 0,
+        .present_value = s_present_mm,
+        .status_flags = s_status_flags,
     };
-    ezb_zcl_cluster_desc_t tuya = ezb_zcl_custom_create_cluster_desc(&tuya_cfg, EZB_ZCL_CLUSTER_SERVER);
+    ezb_zcl_cluster_desc_t analog = ezb_zcl_analog_input_create_cluster_desc(&analog_cfg, EZB_ZCL_CLUSTER_SERVER);
+    ESP_ERROR_CHECK(ezb_zcl_analog_input_cluster_desc_add_attr(analog, EZB_ZCL_ATTR_ANALOG_INPUT_MIN_PRESENT_VALUE_ID,
+                                                               &s_alarm_min));
+    ESP_ERROR_CHECK(ezb_zcl_analog_input_cluster_desc_add_attr(analog, EZB_ZCL_ATTR_ANALOG_INPUT_MAX_PRESENT_VALUE_ID,
+                                                               &s_alarm_max));
+    ESP_ERROR_CHECK(ezb_zcl_cluster_desc_add_manuf_attr(analog, ATTR_TANK_HEIGHT, EZB_ZCL_ATTR_TYPE_SINGLE, ACCESS_SETTING,
+                                                        EZB_ZCL_STD_MANUF_CODE, &s_tank_height_mm));
+    ESP_ERROR_CHECK(ezb_zcl_cluster_desc_add_manuf_attr(analog, ATTR_FILLING, EZB_ZCL_ATTR_TYPE_SINGLE, ACCESS_STATE,
+                                                        EZB_ZCL_STD_MANUF_CODE, &s_filling));
+    ESP_ERROR_CHECK(ezb_zcl_cluster_desc_add_manuf_attr(analog, ATTR_MEASURE_PERIOD, EZB_ZCL_ATTR_TYPE_UINT16,
+                                                        ACCESS_SETTING, EZB_ZCL_STD_MANUF_CODE, &s_period_min));
+    force_access(analog, EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, ACCESS_STATE);
+    force_access(analog, EZB_ZCL_ATTR_ANALOG_INPUT_OUT_OF_SERVICE_ID, ACCESS_STATE);
+    force_access(analog, EZB_ZCL_ATTR_ANALOG_INPUT_MIN_PRESENT_VALUE_ID, ACCESS_SETTING);
+    force_access(analog, EZB_ZCL_ATTR_ANALOG_INPUT_MAX_PRESENT_VALUE_ID, ACCESS_SETTING);
+
+    ezb_zcl_temperature_measurement_cluster_server_config_t temp_cfg = {
+        .measured_value = s_temperature,
+        .min_measured_value = (int16_t)0x8000,
+        .max_measured_value = (int16_t)0x8000,
+    };
+    ezb_zcl_cluster_desc_t temperature =
+        ezb_zcl_temperature_measurement_create_cluster_desc(&temp_cfg, EZB_ZCL_CLUSTER_SERVER);
+
+    ezb_zcl_on_off_cluster_server_config_t on_off_cfg = {
+        .on_off = false,
+    };
+    ezb_zcl_cluster_desc_t on_off = ezb_zcl_on_off_create_cluster_desc(&on_off_cfg, EZB_ZCL_CLUSTER_SERVER);
+    ESP_ERROR_CHECK(ezb_zcl_cluster_desc_add_manuf_attr(on_off, ATTR_INVERT, EZB_ZCL_ATTR_TYPE_BOOL, ACCESS_SETTING,
+                                                        EZB_ZCL_STD_MANUF_CODE, &s_invert));
 
     ezb_af_ep_config_t ep_cfg = {
         .ep_id = ZIGBEE_ENDPOINT,
@@ -475,8 +454,11 @@ esp_err_t water_zigbee_device_create(void)
     ESP_RETURN_ON_FALSE(ep, ESP_FAIL, TAG, "endpoint");
     ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep, basic));
     ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep, power));
-    ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep, tuya));
+    ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep, analog));
+    ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep, temperature));
+    ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep, on_off));
     ESP_ERROR_CHECK(ezb_af_device_add_endpoint_desc(dev, ep));
     ESP_ERROR_CHECK(ezb_af_device_desc_register(dev));
+    ezb_zcl_core_action_handler_register(zcl_core_action);
     return ESP_OK;
 }
