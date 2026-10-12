@@ -83,7 +83,7 @@
 #define VL53L0X_XSHUT_GPIO 12
 /* LP GPIO. Held low through deep sleep so the load switch stays off. */
 #define VL53L0X_POWER_GPIO 14
-#define VL53L0X_POWER_ON_LEVEL 1
+#define VL53L0X_POWER_ON_LEVEL 0 // 1 when using a TPS22918 low-side switch, and 0 when using an AO3401 high-side switch
 #define VL53L0X_I2C_ADDR 0x29
 /*
  * Shortest ranging budget the VL53L0X allows with its default steps.
@@ -102,4 +102,4 @@
 #define FACTORY_RESET_GPIO 13
 
 /* VL53L0X readings at or above this are "no target". */
-#define VL53L0X_INVALID_MM 8000
+#define VL53L0X_INVALID_MM 2500

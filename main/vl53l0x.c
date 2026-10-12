@@ -408,6 +408,25 @@ static void pin_hold(gpio_num_t pin, int level)
     }
 }
 
+/* Input with the pull-up on, then held. The pin does not drive the line,
+ * so a module pull-up to 3.3 V draws nothing while the level stays high. */
+static void pin_release_high(gpio_num_t pin)
+{
+    gpio_hold_dis(pin);
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << pin,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+    esp_err_t err = gpio_hold_en(pin);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "GPIO %d will not stay high in deep sleep (%s)", (int)pin, esp_err_to_name(err));
+    }
+}
+
 static void bus_close(void)
 {
     if (s_dev) {
@@ -445,9 +464,10 @@ static esp_err_t bus_open(void)
 void vl53l0x_shutdown(void)
 {
     bus_close();
-    /* I2C lines go low before the supply, so the pull-ups cannot feed the module. */
-    pin_hold(I2C_SDA_GPIO, 0);
-    pin_hold(I2C_SCL_GPIO, 0);
+    /* Leave SDA and SCL undriven. The pull-ups hold them high so they
+     * do not drain the module while XSHUT is low. */
+    pin_release_high(I2C_SDA_GPIO);
+    pin_release_high(I2C_SCL_GPIO);
     pin_hold(VL53L0X_XSHUT_GPIO, 0);
     pin_hold(VL53L0X_POWER_GPIO, VL53L0X_POWER_ON_LEVEL ? 0 : 1);
 }

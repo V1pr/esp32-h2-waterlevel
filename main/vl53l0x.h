@@ -10,7 +10,7 @@ esp_err_t vl53l0x_begin(void);
 esp_err_t vl53l0x_read_once(uint16_t *distance_mm);
 
 /*
- * Remove power and hold the supply, XSHUT, and I2C lines low through
- * deep sleep. Safe to call more than once.
+ * Remove power, hold XSHUT low, and release SDA/SCL high through deep
+ * sleep. Safe to call more than once.
  */
 void vl53l0x_shutdown(void);

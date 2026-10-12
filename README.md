@@ -10,49 +10,17 @@ Defaults are in `main/app_config.h`.
 
 | Function | GPIO | Notes |
 | --- | --- | --- |
-| VL53L0X SDA | 10 | 3.3 V I2C. Driven low during deep sleep so it cannot feed the unpowered module. |
+| VL53L0X SDA | 10 | 3.3 V I2C. Released and held high in deep sleep, so the module pull-ups draw nothing. |
 | VL53L0X SCL | 11 | Same as SDA. |
-| VL53L0X XSHUT | 12 | Released only while a reading is in progress. |
-| VL53L0X power | 14 | High enables a high-side load switch for the module VIN. Held low in deep sleep. |
+| VL53L0X XSHUT | 12 | Held low in deep sleep. Released only while a reading is in progress. |
 | Battery ADC | 1 | Middle node of the divider. |
 | Divider sink | 3 | Bottom resistor returns here, not to GND. Driven low only while sampling. Set `BATTERY_SINK_GPIO` to `-1` if the resistor is tied to GND. |
 | Reset button | 13 | To GND. Wakes the chip and factory-resets the Zigbee network. |
 
-Do not tie VL53L0X VIN straight to 3.3 V, and do not power the module from a GPIO. Ranging draws about 20 mA with higher peaks. GPIO14 only enables a high-side load switch, and only for the reading. Each shot uses a 20 ms timing budget (`VL53L0X_TIMING_BUDGET_US`). Mount the sensor above the water, looking down.
-
-Use a **TPS22918** in SOT-23-6 (orderable part **TPS22918DBVR**). ON is active high, which matches the firmware. Off current is about 0.5 µA. Pin 1 is the pin by the package mark, looking at the top of the chip:
+Tie the module VIN to 3.3 V. Do not power it from a GPIO. Ranging draws about 20 mA with higher peaks. XSHUT low puts the sensor in hardware standby between readings. Each shot uses a 20 ms timing budget (`VL53L0X_TIMING_BUDGET_US`). Mount the sensor above the water, looking down.
 
 ```text
-        mark
-     +--------+
-VIN  |1      6| VOUT
-GND  |2      5| QOD
-ON   |3      4| CT
-     +--------+
-```
-
-| Pin | Name | Connect to |
-| --- | --- | --- |
-| 1 | VIN | ESP32-H2 3V3, with 1 µF ceramic to GND at the pin |
-| 2 | GND | GND |
-| 3 | ON | GPIO14, and a 100 kΩ pulldown to GND |
-| 4 | CT | Leave open. A capacitor here only slows turn-on. |
-| 5 | QOD | VOUT (pin 6), so the sensor supply is discharged when the switch opens |
-| 6 | VOUT | VL53L0X VIN |
-
-ON must not float. The pulldown keeps the switch off until the firmware drives GPIO14. The firmware holds that pin low through deep sleep.
-
-```text
-3V3 ----+---- TPS22918 VIN (1)
-        |         VOUT (6) ---- VL53L0X VIN
-       1µF        QOD (5) ---- VOUT
-        |         CT (4) open
-       GND        ON (3) ----+---- GPIO14
-                             |
-                           100k
-                             |
-                            GND
-
+3V3 ------------------- VL53L0X VIN
 GPIO10 ---------------- VL53L0X SDA
 GPIO11 ---------------- VL53L0X SCL
 GPIO12 ---------------- VL53L0X XSHUT
@@ -60,6 +28,8 @@ GND ------------------- VL53L0X GND
 ```
 
 Leave the module's interrupt pin unconnected.
+
+A high-side load switch on VIN can remove the module regulator's idle current as well. GPIO14 is free for its enable pin. If that switch opens during deep sleep, SDA and SCL must be driven low and held there. Released-high lines back-feed an unpowered module through its I2C pull-ups. That drive-low behaviour is not what `vl53l0x_shutdown()` does now.
 
 ## Battery
 
